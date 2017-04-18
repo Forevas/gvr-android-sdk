@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All Rights Reserved.
+ * Copyright 2017 Google Inc. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,20 +16,19 @@
 
 package com.google.vr.sdk.samples.treasurehunt;
 
-import com.google.vr.sdk.audio.GvrAudioEngine;
-import com.google.vr.sdk.base.Eye;
-import com.google.vr.sdk.base.GvrActivity;
-import com.google.vr.sdk.base.GvrView;
-import com.google.vr.sdk.base.HeadTransform;
-import com.google.vr.sdk.base.Viewport;
-
 import android.content.Context;
 import android.opengl.GLES20;
 import android.opengl.Matrix;
 import android.os.Bundle;
 import android.os.Vibrator;
 import android.util.Log;
-
+import com.google.vr.sdk.audio.GvrAudioEngine;
+import com.google.vr.sdk.base.AndroidCompat;
+import com.google.vr.sdk.base.Eye;
+import com.google.vr.sdk.base.GvrActivity;
+import com.google.vr.sdk.base.GvrView;
+import com.google.vr.sdk.base.HeadTransform;
+import com.google.vr.sdk.base.Viewport;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -37,15 +36,16 @@ import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
-
 import javax.microedition.khronos.egl.EGLConfig;
 
 /**
  * A Google VR sample application.
- * </p><p>
- * The TreasureHunt scene consists of a planar ground grid and a floating
+ *
+ * <p>The TreasureHunt scene consists of a planar ground grid and a floating
  * "treasure" cube. When the user looks at the cube, the cube will turn gold.
- * While gold, the user can activate the Carboard trigger, which will in turn
+ * While gold, the user can activate the Cardboard trigger, either directly
+ * using the touch trigger on their Cardboard viewer, or using the Daydream
+ * controller-based trigger emulation. Activating the trigger will in turn
  * randomly reposition the cube.
  */
 public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoRenderer {
@@ -75,7 +75,8 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
   private static final float MIN_MODEL_DISTANCE = 3.0f;
   private static final float MAX_MODEL_DISTANCE = 7.0f;
 
-  private static final String SOUND_FILE = "cube_sound.wav";
+  private static final String OBJECT_SOUND_FILE = "cube_sound.wav";
+  private static final String SUCCESS_SOUND_FILE = "success.wav";
 
   private final float[] lightPosInEyeSpace = new float[4];
 
@@ -123,7 +124,8 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
   private Vibrator vibrator;
 
   private GvrAudioEngine gvrAudioEngine;
-  private volatile int soundId = GvrAudioEngine.INVALID_ID;
+  private volatile int sourceId = GvrAudioEngine.INVALID_ID;
+  private volatile int successSourceId = GvrAudioEngine.INVALID_ID;
 
   /**
    * Converts a raw text file, saved as a resource, into an OpenGL ES shader.
@@ -204,13 +206,18 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
 
     gvrView.setRenderer(this);
     gvrView.setTransitionViewEnabled(true);
-    gvrView.setOnCardboardBackButtonListener(
-        new Runnable() {
-          @Override
-          public void run() {
-            onBackPressed();
-          }
-        });
+
+    // Enable Cardboard-trigger feedback with Daydream headsets. This is a simple way of supporting
+    // Daydream controller input for basic interactions using the existing Cardboard trigger API.
+    gvrView.enableCardboardTriggerEmulation();
+
+    if (gvrView.setAsyncReprojectionEnabled(true)) {
+      // Async reprojection decouples the app framerate from the display framerate,
+      // allowing immersive interaction even at the throttled clockrates set by
+      // sustained performance mode.
+      AndroidCompat.setSustainedPerformanceMode(this, true);
+    }
+
     setGvrView(gvrView);
   }
 
@@ -343,14 +350,16 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
             new Runnable() {
               @Override
               public void run() {
-                // Start spatial audio playback of SOUND_FILE at the model postion. The returned
-                //soundId handle is stored and allows for repositioning the sound object whenever
-                // the cube position changes.
-                gvrAudioEngine.preloadSoundFile(SOUND_FILE);
-                soundId = gvrAudioEngine.createSoundObject(SOUND_FILE);
+                // Start spatial audio playback of OBJECT_SOUND_FILE at the model position. The
+                // returned sourceId handle is stored and allows for repositioning the sound object
+                // whenever the cube position changes.
+                gvrAudioEngine.preloadSoundFile(OBJECT_SOUND_FILE);
+                sourceId = gvrAudioEngine.createSoundObject(OBJECT_SOUND_FILE);
                 gvrAudioEngine.setSoundObjectPosition(
-                    soundId, modelPosition[0], modelPosition[1], modelPosition[2]);
-                gvrAudioEngine.playSound(soundId, true /* looped playback */);
+                    sourceId, modelPosition[0], modelPosition[1], modelPosition[2]);
+                gvrAudioEngine.playSound(sourceId, true /* looped playback */);
+                // Preload an unspatialized sound to be played on a successful trigger on the cube.
+                gvrAudioEngine.preloadSoundFile(SUCCESS_SOUND_FILE);
               }
             })
         .start();
@@ -368,9 +377,9 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
     Matrix.translateM(modelCube, 0, modelPosition[0], modelPosition[1], modelPosition[2]);
 
     // Update the sound location to match it with the new cube position.
-    if (soundId != GvrAudioEngine.INVALID_ID) {
+    if (sourceId != GvrAudioEngine.INVALID_ID) {
       gvrAudioEngine.setSoundObjectPosition(
-          soundId, modelPosition[0], modelPosition[1], modelPosition[2]);
+          sourceId, modelPosition[0], modelPosition[1], modelPosition[2]);
     }
     checkGLError("updateCubePosition");
   }
@@ -494,6 +503,12 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
     GLES20.glEnableVertexAttribArray(cubeColorParam);
 
     GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 36);
+
+    // Disable vertex arrays
+    GLES20.glDisableVertexAttribArray(cubePositionParam);
+    GLES20.glDisableVertexAttribArray(cubeNormalParam);
+    GLES20.glDisableVertexAttribArray(cubeColorParam);
+    
     checkGLError("Drawing cube");
   }
 
@@ -523,6 +538,10 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
 
     GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 24);
 
+    GLES20.glDisableVertexAttribArray(floorPositionParam);
+    GLES20.glDisableVertexAttribArray(floorNormalParam);
+    GLES20.glDisableVertexAttribArray(floorColorParam);
+
     checkGLError("drawing floor");
   }
 
@@ -534,6 +553,8 @@ public class TreasureHuntActivity extends GvrActivity implements GvrView.StereoR
     Log.i(TAG, "onCardboardTrigger");
 
     if (isLookingAtObject()) {
+      successSourceId = gvrAudioEngine.createStereoSound(SUCCESS_SOUND_FILE);
+      gvrAudioEngine.playSound(successSourceId, false /* looping disabled */);
       hideObject();
     }
 

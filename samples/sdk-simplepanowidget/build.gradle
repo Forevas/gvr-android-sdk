@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Google Inc. All rights reserved.
+ * Copyright 2017 Google Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,36 +13,29 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-apply plugin: 'com.android.application'
+apply plugin: 'com.android.model.application'
 
-android {
-    compileSdkVersion 23
-    buildToolsVersion "23.0.1"
+model {
+    android {
+        compileSdkVersion 25
+        buildToolsVersion "25.0.0"
 
-    defaultConfig {
-        minSdkVersion 19
-        targetSdkVersion 22
-        versionCode 1
-        versionName "1.0"
-    }
+        defaultConfig {
+            minSdkVersion.apiLevel 19
+            targetSdkVersion.apiLevel 22
+            versionCode 1
+            versionName "1.0"
+        }
 
-/** See the documentation in libraries/native/README.md regarding architectures.
-    sourceSets {
-        main {
-            jniLibs.srcDir file('jniLibs/')
+        buildTypes {
+            release {
+                minifyEnabled true
+                proguardFiles.add(file('../../proguard-gvr.txt'))
+            }
         }
     }
-**/
-
-/** Use this to remove the default native library.
-    packagingOptions {
-        exclude('lib/armeabi-v7a/libpanorenderer.so')
-    }
-**/
 }
 
 dependencies {
-    compile project(':libraries-common')
-    compile project(':libraries-commonwidget')
-    compile project(':libraries-panowidget')
+    compile 'com.google.vr:sdk-panowidget:1.40.0'
 }
