@@ -34,7 +34,7 @@ import com.google.vr.ndk.base.GvrLayout.ExternalSurfaceListener;
 /**
  * Simple activity for video playback using the Asynchronous Reprojection Video Surface API. For a
  * detailed description of the API, see the <a
- * href="https://developers.google.com/vr/android/ndk/gvr-ndk-walkthrough#using_video_viewports">ndk
+ * href="https://developers.google.com/vr/android/ndk/gvr-ndk-rendering#using_video_viewports">ndk
  * walkthrough</a>. This sample supports DRM and unprotected video playback, configured in {@link
  * Configuration}.
  *
@@ -51,14 +51,18 @@ public class WatchVideoActivity extends Activity {
   private GLSurfaceView surfaceView;
   private VideoSceneRenderer renderer;
   private VideoExoPlayer2 videoPlayer;
+  private Settings settings;
   private boolean hasFirstFrame;
 
   // Transform a quad that fills the clip box at Z=0 to a 16:9 screen at Z=-4. Note that the matrix
-  // is column-major, so the translation is on the last line in this representation.
-  private final float[] videoTransform = { 1.6f, 0.0f, 0.0f, 0.0f,
-                                           0.0f, 0.9f, 0.0f, 0.0f,
-                                           0.0f, 0.0f, 1.0f, 0.0f,
-                                           0.0f, 0.0f, -4.f, 1.0f };
+  // is column-major, so the translation is on the last row rather than the last column in this
+  // representation.
+  private final float[] videoTransform = {
+    1.6f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.9f, 0.0f, 0.0f,
+    0.0f, 0.0f, 1.0f, 0.0f,
+    0.0f, 0.0f, -4.f, 1.0f
+  };
 
   // Runnable to refresh the viewer profile when gvrLayout is resumed.
   // This is done on the GL thread because refreshViewerProfile isn't thread-safe.
@@ -84,6 +88,8 @@ public class WatchVideoActivity extends Activity {
   @Override
   protected void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
+    settings = new Settings(this, getIntent().getExtras());
+
     setImmersiveSticky();
     getWindow()
         .getDecorView()
@@ -106,7 +112,7 @@ public class WatchVideoActivity extends Activity {
     surfaceView.setEGLConfigChooser(5, 6, 5, 0, 0, 0);
     gvrLayout.setPresentationView(surfaceView);
     gvrLayout.setKeepScreenOn(true);
-    renderer = new VideoSceneRenderer(this, gvrLayout.getGvrApi());
+    renderer = new VideoSceneRenderer(this, gvrLayout.getGvrApi(), settings);
 
     // Initialize the ExternalSurfaceListener to receive video Surface callbacks.
     hasFirstFrame = false;
@@ -118,8 +124,10 @@ public class WatchVideoActivity extends Activity {
             // is started when the Surface is set. Note that this callback is *asynchronous* with
             // respect to the Surface becoming available, in which case videoPlayer may be null due
             // to the Activity having been stopped.
+            Log.i(TAG, "onSurfaceAvailable: " + surface);
             if (videoPlayer != null) {
               videoPlayer.setSurface(surface);
+              Log.i(TAG, "Video surface set on player.");
             }
           }
 
@@ -133,6 +141,7 @@ public class WatchVideoActivity extends Activity {
                 new Runnable() {
                   @Override
                   public void run() {
+                    Log.i(TAG, "Video has started playback, update renderer.");
                     renderer.setHasVideoPlaybackStarted(true);
                   }
                 });
@@ -142,23 +151,17 @@ public class WatchVideoActivity extends Activity {
           }
         };
 
-    // Note that the video Surface must be enabled before enabling Async Reprojection.
-    // Async Reprojection must be enabled for the app to be able to use the video Surface.
-    boolean isSurfaceEnabled =
+    // Note that enabling video Surface support will also enable async reprojection.
+    boolean isAsyncReprojectionEnabled =
         gvrLayout.enableAsyncReprojectionVideoSurface(
             videoSurfaceListener,
             new Handler(Looper.getMainLooper()),
             /* Whether video playback should use a protected reprojection pipeline. */
-            Configuration.USE_PROTECTED_PIPELINE);
-    boolean isAsyncReprojectionEnabled = gvrLayout.setAsyncReprojectionEnabled(true);
+            settings.useDrmVideoSample);
 
-    if (!isSurfaceEnabled || !isAsyncReprojectionEnabled) {
+    if (!isAsyncReprojectionEnabled) {
       // The device does not support this API, video will not play.
-      Log.e(
-          TAG,
-          "UnsupportedException: "
-              + (!isAsyncReprojectionEnabled ? "Async Reprojection not supported. " : "")
-              + (!isSurfaceEnabled ? "Async Reprojection Video Surface not enabled." : ""));
+      Log.e(TAG, "UnsupportedException: Async Reprojection with Video is unsupported.");
     } else {
       initVideoPlayer();
 
@@ -191,21 +194,24 @@ public class WatchVideoActivity extends Activity {
   }
 
   private void initVideoPlayer() {
-    videoPlayer = new VideoExoPlayer2(getApplication());
+    videoPlayer = new VideoExoPlayer2(getApplication(), settings);
     Uri streamUri;
     String drmVideoId = null;
 
-    if (Configuration.USE_DRM_VIDEO_SAMPLE) {
+    if (settings.useDrmVideoSample) {
       // Protected video, requires a secure path for playback.
+      Log.i(TAG, "Using DRM-protected video sample.");
       streamUri = Uri.parse("https://storage.googleapis.com/wvmedia/cenc/h264/tears/tears.mpd");
       drmVideoId = "0894c7c8719b28a0";
     } else {
       // Unprotected video, does not require a secure path for playback.
+      Log.i(TAG, "Using cleartext video sample.");
       streamUri = Uri.parse("https://storage.googleapis.com/wvmedia/clear/h264/tears/tears.mpd");
     }
 
     try {
       videoPlayer.initPlayer(streamUri, drmVideoId);
+      renderer.setVideoPlayer(videoPlayer);
     } catch (UnsupportedDrmException e) {
       Log.e(TAG, "Error initializing video player", e);
     }
@@ -254,6 +260,7 @@ public class WatchVideoActivity extends Activity {
   @Override
   protected void onStop() {
     if (videoPlayer != null) {
+      renderer.setVideoPlayer(null);
       videoPlayer.releasePlayer();
       videoPlayer = null;
     }
@@ -269,6 +276,7 @@ public class WatchVideoActivity extends Activity {
   @Override
   protected void onDestroy() {
     gvrLayout.shutdown();
+    settings = null;
     super.onDestroy();
   }
 
@@ -290,6 +298,12 @@ public class WatchVideoActivity extends Activity {
     }
   }
 
+  @Override
+  public void onBackPressed() {
+    super.onBackPressed();
+    gvrLayout.onBackPressed();
+  }
+
   private void setImmersiveSticky() {
     getWindow()
         .getDecorView()
@@ -302,12 +316,17 @@ public class WatchVideoActivity extends Activity {
                 | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
   }
 
-  protected VideoExoPlayer2 getVideoExoPlayer() {
-    return videoPlayer;
+  /**
+   * Returns true if video is currently playing. This method should only be called in the UI thread.
+   */
+  public boolean isVideoPlaying() {
+    return (hasFirstFrame && !isVideoPaused());
   }
 
-  /** @return {@code true} if the first video frame has played **/
-  protected boolean hasFirstFrame() {
-    return hasFirstFrame;
+  /**
+   * Returns true if video is currently paused. This method should only be called in the UI thread.
+   */
+  public boolean isVideoPaused() {
+    return (videoPlayer != null) && (videoPlayer.isPaused());
   }
 }

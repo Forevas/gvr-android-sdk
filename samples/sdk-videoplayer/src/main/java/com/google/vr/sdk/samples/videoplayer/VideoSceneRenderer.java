@@ -21,6 +21,8 @@ import android.graphics.RectF;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView.Renderer;
 import android.opengl.Matrix;
+import com.google.android.exoplayer2.Format;
+import com.google.android.exoplayer2.ext.gvr.GvrAudioProcessor;
 import com.google.vr.ndk.base.BufferSpec;
 import com.google.vr.ndk.base.BufferViewport;
 import com.google.vr.ndk.base.BufferViewportList;
@@ -33,7 +35,7 @@ import javax.microedition.khronos.opengles.GL10;
 
 /**
  * The main app renderer. Draws the scene the video is displayed in a color buffer, and signals to
- * the the GvrApi to render video from the ExternalSurface at the specified ID.
+ * the GvrApi to render video from the ExternalSurface at the specified ID.
  */
 public class VideoSceneRenderer implements Renderer {
 
@@ -46,16 +48,20 @@ public class VideoSceneRenderer implements Renderer {
   private static final float NEAR_PLANE = 1.0f;
   private static final float FAR_PLANE = 10.0f;
 
-  private final GvrApi api;
   private final Context context;
+  private final GvrApi api;
+  private final Settings settings;
   private final BufferViewportList recommendedList;
   private final BufferViewportList viewportList;
   private final BufferViewport scratchViewport;
 
   private final long predictionOffsetNanos;
 
+  private GvrAudioProcessor gvrAudioProcessor;
   private SwapChain swapChain;
   private VideoScene videoScene;
+  private VideoExoPlayer2 videoPlayer;
+  private final Object videoPlayerLock = new Object();
   private volatile int videoSurfaceID = BufferViewport.EXTERNAL_SURFACE_ID_NONE;
   private volatile boolean shouldShowVideo = false;
 
@@ -70,9 +76,10 @@ public class VideoSceneRenderer implements Renderer {
   private final RectF eyeUv = new RectF();
   private final Point targetSize = new Point();
 
-  VideoSceneRenderer(Context context, GvrApi api) {
+  VideoSceneRenderer(Context context, GvrApi api, Settings settings) {
     this.context = context;
     this.api = api;
+    this.settings = settings;
     recommendedList = api.createBufferViewportList();
     viewportList = api.createBufferViewportList();
     scratchViewport = api.createBufferViewport();
@@ -86,6 +93,19 @@ public class VideoSceneRenderer implements Renderer {
     scratchViewport.shutdown();
     if (swapChain != null) {
       swapChain.shutdown();
+    }
+  }
+
+  /** Sets the video player which is decoding the video. It will be used to query decoder counters
+   * and access the GVR audio processor. */
+  public void setVideoPlayer(VideoExoPlayer2 player) {
+    synchronized (videoPlayerLock) {
+      this.videoPlayer = player;
+      if (player != null) {
+        this.gvrAudioProcessor = player.getGvrAudioProcessor();
+      } else {
+        this.gvrAudioProcessor = null;
+      }
     }
   }
 
@@ -164,13 +184,7 @@ public class VideoSceneRenderer implements Renderer {
   @Override
   public void onDrawFrame(GL10 gl) {
     Frame frame = swapChain.acquireFrame();
-
-    api.getHeadSpaceFromStartSpaceRotation(
-        headFromWorld, System.nanoTime() + predictionOffsetNanos);
-    for (int eye = 0; eye < 2; ++eye) {
-      api.getEyeFromHeadMatrix(eye, eyeFromHead);
-      Matrix.multiplyMM(eyeFromWorld[eye], 0, eyeFromHead, 0, headFromWorld, 0);
-    }
+    updateHeadAndEyeMatrices();
     // Populate the BufferViewportList to describe to the GvrApi how the color buffer
     // and video frame ExternalSurface buffer should be rendered. The eyeFromQuad matrix
     // describes how the video Surface frame should be transformed and rendered in eye space.
@@ -182,11 +196,34 @@ public class VideoSceneRenderer implements Renderer {
 
   private void initVideoScene() {
     // Initialize the video scene. Draws the app's color buffer.
-    videoScene = new VideoScene();
+    videoScene = new VideoScene(settings);
     videoScene.prepareGLResources(context);
     videoScene.setHasVideoPlaybackStarted(shouldShowVideo);
     videoScene.setVideoSurfaceId(videoSurfaceID);
     videoScene.setVideoTransform(worldFromQuad);
+  }
+
+  private void updateHeadAndEyeMatrices() {
+    api.getHeadSpaceFromStartSpaceRotation(
+        headFromWorld, System.nanoTime() + predictionOffsetNanos);
+    for (int eye = 0; eye < 2; ++eye) {
+      api.getEyeFromHeadMatrix(eye, eyeFromHead);
+      Matrix.multiplyMM(eyeFromWorld[eye], 0, eyeFromHead, 0, headFromWorld, 0);
+    }
+    if (gvrAudioProcessor != null) {
+      float sx = headFromWorld[0];
+      float sy = headFromWorld[5];
+      float sz = headFromWorld[10];
+      float w = (float) Math.sqrt(Math.max(0.0f, 1.0 + sx + sy + sz)) * 0.5f;
+      float x = (float) Math.sqrt(Math.max(0.0f, 1.0 + sx - sy - sz)) * 0.5f;
+      float y = (float) Math.sqrt(Math.max(0.0f, 1.0 - sx + sy - sz)) * 0.5f;
+      float z = (float) Math.sqrt(Math.max(0.0f, 1.0 - sx - sy + sz)) * 0.5f;
+      gvrAudioProcessor.updateOrientation(
+          (headFromWorld[6] - headFromWorld[9] < 0) != (x < 0) ? -x : x,
+          (headFromWorld[8] - headFromWorld[2] < 0) != (y < 0) ? -y : y,
+          (headFromWorld[1] - headFromWorld[4] < 0) != (z < 0) ? -z : z,
+          w);
+    }
   }
 
   private void populateBufferViewportList() {
@@ -210,15 +247,30 @@ public class VideoSceneRenderer implements Renderer {
       viewportList.set(2 + eye, scratchViewport);
     }
   }
-  
+
   private void drawScene(GL10 gl, Frame frame) {
-    // Draw the scene framebuffer.
+    // Before drawing the scene, update the average FPS achieved by the video decoder over the last
+    // three seconds. This will be used to set the size and color of the frame rate bar under the
+    // video.
+    synchronized (videoPlayerLock) {
+      if (videoPlayer != null) {
+        float nativeFrameRate = 100.f;
+        Format videoFormat = videoPlayer.getPlayer().getVideoFormat();
+        if (videoFormat != null) {
+          nativeFrameRate = videoFormat.frameRate;
+        }
+        videoScene.updateVideoFpsFraction(
+            3L, nativeFrameRate, videoPlayer.getPlayer().getVideoDecoderCounters());
+      }
+    }
+    // Draw the scene framebuffer consisting of a solid gray background, a static texture if the
+    // video hasn't started playing yet, and a bar showing the fraction of the video's native frame
+    // rate achieved by the video decoder. If everything works correctly, the bar should always be
+    // green.
     frame.bindBuffer(INDEX_SCENE_BUFFER);
-    // Draw background color
-    GLES20.glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    GLES20.glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
     GLES20.glDisable(GLES20.GL_DEPTH_TEST);
-
     GLUtil.checkGlError(TAG, "new frame");
 
     for (int eye = 0; eye < 2; ++eye) {

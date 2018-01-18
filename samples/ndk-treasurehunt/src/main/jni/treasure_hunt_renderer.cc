@@ -22,6 +22,8 @@
 #include <cmath>
 #include <random>
 
+#include "vr/gvr/capi/include/gvr_version.h"
+
 #define LOG_TAG "TreasureHuntCPP"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -33,16 +35,18 @@
   }
 
 namespace {
-static const float kZNear = 1.0f;
-static const float kZFar = 100.0f;
+static const float kZNear = 0.01f;
+static const float kZFar = 10.0f;
 
 // For now, to avoid writing a raycasting system, put the reticle closer than
 // any objects.
-static const float kMinCubeDistance = 4.5f;
-static const float kMaxCubeDistance = 8.0f;
-static const float kReticleDistance = 3.0f;
+static const float kMinCubeDistance = 3.5f;
+static const float kMaxCubeDistance = 7.0f;
+static const float kReticleDistance = 2.0f;
 
-static const float kFloorDepth = 20.0f;
+// Depth of the ground plane, in meters. If this (and other distances)
+// are too far, 6DOF tracking will have no visible effect.
+static const float kDefaultFloorHeight = -2.0f;
 
 static const int kCoordsPerVertex = 3;
 
@@ -50,17 +54,15 @@ static const uint64_t kPredictionTimeWithoutVsyncNanos = 50000000;
 
 // Angle threshold for determining whether the controller is pointing at the
 // object.
-static const float kAngleLimit = 0.12f;
-// Angle threshold for determining whether the viewer is looking at the object.
-static const float kPitchLimit = 0.12f;
-static const float kYawLimit = 0.12f;
+static const float kAngleLimit = 0.2f;
 
 // Sound file in APK assets.
 static const char* kObjectSoundFile = "cube_sound.wav";
 static const char* kSuccessSoundFile = "success.wav";
 
+// Convert a GVR matrix to an array of floats suitable for passing to OpenGL.
 static std::array<float, 16> MatrixToGLArray(const gvr::Mat4f& matrix) {
-  // Note that this performs a *tranpose* to a column-major matrix array, as
+  // Note that this performs a *transpose* to a column-major matrix array, as
   // expected by GL.
   std::array<float, 16> result;
   for (int i = 0; i < 4; ++i) {
@@ -96,6 +98,7 @@ static std::array<float, 6> VectorPairToGLArray(
   return result;
 }
 
+// Multiply a vector by a matrix.
 static std::array<float, 4> MatrixVectorMul(const gvr::Mat4f& matrix,
                                             const std::array<float, 4>& vec) {
   std::array<float, 4> result;
@@ -108,6 +111,7 @@ static std::array<float, 4> MatrixVectorMul(const gvr::Mat4f& matrix,
   return result;
 }
 
+// Multiply two matrices.
 static gvr::Mat4f MatrixMul(const gvr::Mat4f& matrix1,
                             const gvr::Mat4f& matrix2) {
   gvr::Mat4f result;
@@ -122,10 +126,13 @@ static gvr::Mat4f MatrixMul(const gvr::Mat4f& matrix1,
   return result;
 }
 
+// Drop the last element of a vector.
 static std::array<float, 3> Vec4ToVec3(const std::array<float, 4>& vec) {
   return {vec[0], vec[1], vec[2]};
 }
 
+// Given a field of view in degrees, compute the corresponding projection
+// matrix.
 static gvr::Mat4f PerspectiveMatrixFromView(const gvr::Rectf& fov, float z_near,
                                             float z_far) {
   gvr::Mat4f result;
@@ -160,6 +167,8 @@ static gvr::Mat4f PerspectiveMatrixFromView(const gvr::Rectf& fov, float z_near,
   return result;
 }
 
+// Multiplies both X coordinates of the rectangle by the given width and both Y
+// coordinates by the given height.
 static gvr::Rectf ModulateRect(const gvr::Rectf& rect, float width,
                                float height) {
   gvr::Rectf result = {rect.left * width, rect.right * width,
@@ -167,6 +176,8 @@ static gvr::Rectf ModulateRect(const gvr::Rectf& rect, float width,
   return result;
 }
 
+// Given the size of a texture in pixels and a rectangle in UV coordinates,
+// computes the corresponding rectangle in pixel coordinates.
 static gvr::Recti CalculatePixelSpaceRect(const gvr::Sizei& texture_size,
                                           const gvr::Rectf& texture_rect) {
   const float width = static_cast<float>(texture_size.width);
@@ -195,6 +206,8 @@ static void CheckGLError(const char* label) {
   }
 }
 
+// Computes a texture size that has approximately half as many pixels. This is
+// equivalent to scaling each dimension by approximately sqrt(2)/2.
 static gvr::Sizei HalfPixelCount(const gvr::Sizei& in) {
   // Scale each dimension by sqrt(2)/2 ~= 7/10ths.
   gvr::Sizei out;
@@ -203,6 +216,8 @@ static gvr::Sizei HalfPixelCount(const gvr::Sizei& in) {
   return out;
 }
 
+// Convert the quaternion describing the controller's orientation to a
+// rotation matrix.
 static gvr::Mat4f ControllerQuatToMatrix(const gvr::ControllerQuat& quat) {
   gvr::Mat4f result;
   const float x = quat.qx;
@@ -269,6 +284,8 @@ TreasureHuntRenderer::TreasureHuntRenderer(
       gvr_controller_api_(nullptr),
       gvr_viewer_type_(gvr_api_->GetViewerType()) {
   ResumeControllerApiAsNeeded();
+
+  LOGD("Built with GVR version: %s", GVR_SDK_VERSION_STRING);
   if (gvr_viewer_type_ == GVR_VIEWER_TYPE_CARDBOARD) {
     LOGD("Viewer type: CARDBOARD");
   } else if (gvr_viewer_type_ == GVR_VIEWER_TYPE_DAYDREAM) {
@@ -359,10 +376,6 @@ void TreasureHuntRenderer::InitializeGl() {
                   {0.0f, 0.707f, -0.707f, 0.0f},
                   {0.0f, 0.707f, 0.707f, -object_distance_},
                   {0.0f, 0.0f, 0.0f, 1.0f}}};
-  model_floor_ = {{{1.0f, 0.0f, 0.0f, 0.0f},
-                   {0.0f, 1.0f, 0.0f, -kFloorDepth},
-                   {0.0f, 0.0f, 1.0f, 0.0f},
-                   {0.0f, 0.0f, 0.0f, 1.0f}}};
   const float rs = 0.04f;  // Reticle scale.
   model_reticle_ = {{{rs, 0.0f, 0.0f, 0.0f},
                      {0.0f, rs, 0.0f, 0.0f},
@@ -430,6 +443,7 @@ void TreasureHuntRenderer::ResumeControllerApiAsNeeded() {
 }
 
 void TreasureHuntRenderer::ProcessControllerInput() {
+  if (gvr_viewer_type_ == GVR_VIEWER_TYPE_CARDBOARD) return;
   const int old_status = gvr_controller_state_.GetApiStatus();
   const int old_connection_state = gvr_controller_state_.GetConnectionState();
 
@@ -453,10 +467,19 @@ void TreasureHuntRenderer::ProcessControllerInput() {
   }
 }
 
-void TreasureHuntRenderer::DrawFrame() {
+void TreasureHuntRenderer::UpdateReticlePosition() {
   if (gvr_viewer_type_ == GVR_VIEWER_TYPE_DAYDREAM) {
     ProcessControllerInput();
+    gvr::Mat4f controller_matrix =
+        ControllerQuatToMatrix(gvr_controller_state_.GetOrientation());
+    modelview_reticle_ =
+        MatrixMul(head_view_, MatrixMul(controller_matrix, model_reticle_));
+  } else {
+    modelview_reticle_ = model_reticle_;
   }
+}
+
+void TreasureHuntRenderer::DrawFrame() {
   PrepareFramebuffer();
   gvr::Frame frame = swapchain_->AcquireFrame();
 
@@ -467,17 +490,29 @@ void TreasureHuntRenderer::DrawFrame() {
     &viewport_left_,
     &viewport_right_,
   };
-  head_view_ = gvr_api_->GetHeadSpaceFromStartSpaceRotation(target_time);
+  head_view_ = gvr_api_->GetHeadSpaceFromStartSpaceTransform(target_time);
   viewport_list_->SetToRecommendedBufferViewports();
+
   gvr::BufferViewport reticle_viewport = gvr_api_->CreateBufferViewport();
   reticle_viewport.SetSourceBufferIndex(1);
-  reticle_viewport.SetReprojection(GVR_REPROJECTION_NONE);
+  if (gvr_viewer_type_ == GVR_VIEWER_TYPE_CARDBOARD) {
+    // Do not reproject the reticle if it's head-locked.
+    reticle_viewport.SetReprojection(GVR_REPROJECTION_NONE);
+  }
   const gvr_rectf fullscreen = { 0, 1, 0, 1 };
   reticle_viewport.SetSourceUv(fullscreen);
+  UpdateReticlePosition();
 
-  gvr::Mat4f controller_matrix =
-      ControllerQuatToMatrix(gvr_controller_state_.GetOrientation());
-  model_cursor_ = MatrixMul(controller_matrix, model_reticle_);
+  gvr::Value floor_height;
+  // This may change when the floor height changes so it's computed every frame.
+  float ground_y = gvr_api_->GetCurrentProperties().Get(
+                       GVR_PROPERTY_TRACKING_FLOOR_HEIGHT, &floor_height)
+                       ? floor_height.f
+                       : kDefaultFloorHeight;
+  model_floor_ = {{{1.0f, 0.0f, 0.0f, 0.0f},
+                   {0.0f, 1.0f, 0.0f, ground_y},
+                   {0.0f, 0.0f, 1.0f, 0.0f},
+                   {0.0f, 0.0f, 0.0f, 1.0f}}};
 
   gvr::Mat4f eye_views[2];
   for (int eye = 0; eye < 2; ++eye) {
@@ -493,7 +528,7 @@ void TreasureHuntRenderer::DrawFrame() {
       viewport_list_->SetBufferViewport(eye, *viewport[eye]);
     }
 
-    reticle_viewport.SetTransform(MatrixMul(eye_from_head, model_reticle_));
+    reticle_viewport.SetTransform(MatrixMul(eye_from_head, modelview_reticle_));
     reticle_viewport.SetTargetEye(gvr_eye);
     // The first two viewports are for the 3D scene (one for each eye), the
     // latter two viewports are for the reticle (one for each eye).
@@ -510,8 +545,6 @@ void TreasureHuntRenderer::DrawFrame() {
         MatrixMul(perspective, modelview_floor_[eye]);
     light_pos_eye_space_[eye] =
         Vec4ToVec3(MatrixVectorMul(eye_views[eye], light_pos_world_space_));
-    modelview_projection_cursor_[eye] =
-        MatrixMul(perspective, MatrixMul(eye_views[eye], model_cursor_));
   }
 
   glEnable(GL_DEPTH_TEST);
@@ -531,17 +564,11 @@ void TreasureHuntRenderer::DrawFrame() {
   }
   frame.Unbind();
 
+  // Draw the reticle on a separate layer.
   frame.BindBuffer(1);
   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // Transparent background.
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-  // In Cardboard viewer, draw head-locked reticle on a separate layer since the
-  // cursor is controlled by head movement. In Daydream viewer, this layer is
-  // left empty, since the cursor is controlled by controller and drawn with
-  // DrawDaydreamCursor() in the same frame buffer as the virtual scene.
-  if (gvr_viewer_type_ == GVR_VIEWER_TYPE_CARDBOARD) {
-    DrawCardboardReticle();
-  }
+  DrawReticle();
   frame.Unbind();
 
   // Submit frame.
@@ -561,14 +588,19 @@ void TreasureHuntRenderer::PrepareFramebuffer() {
       HalfPixelCount(gvr_api_->GetMaximumEffectiveRenderTargetSize());
   if (render_size_.width != recommended_size.width ||
       render_size_.height != recommended_size.height) {
-    // We need to resize the framebuffer.
-    swapchain_->ResizeBuffer(0, recommended_size);
+    // We need to resize the framebuffer. Note that multiview uses two texture
+    // layers, each with half the render width.
+    gvr::Sizei framebuffer_size = recommended_size;
+    if (multiview_enabled_) {
+      framebuffer_size.width /= 2;
+    }
+    swapchain_->ResizeBuffer(0, framebuffer_size);
     render_size_ = recommended_size;
   }
 }
 
 void TreasureHuntRenderer::OnTriggerEvent() {
-  if (ObjectIsFound()) {
+  if (IsPointingAtObject()) {
     success_source_id_ = gvr_audio_api_->CreateStereoSound(kSuccessSoundFile);
     gvr_audio_api_->PlaySound(success_source_id_, false /* looping disabled */);
     HideObject();
@@ -633,9 +665,6 @@ void TreasureHuntRenderer::DrawWorld(ViewType view) {
   }
   DrawCube(view);
   DrawFloor(view);
-  if (gvr_viewer_type_ == GVR_VIEWER_TYPE_DAYDREAM) {
-    DrawDaydreamCursor(view);
-  }
 }
 
 void TreasureHuntRenderer::DrawCube(ViewType view) {
@@ -672,7 +701,7 @@ void TreasureHuntRenderer::DrawCube(ViewType view) {
   glEnableVertexAttribArray(cube_normal_param_);
 
   // Set vertex colors
-  if (ObjectIsFound()) {
+  if (IsPointingAtObject()) {
     const float* found_color = world_layout_data_.cube_found_color.data();
     glVertexAttrib4f(cube_color_param_, found_color[0], found_color[1],
                      found_color[2], 1.0f);
@@ -725,26 +754,7 @@ void TreasureHuntRenderer::DrawFloor(ViewType view) {
   CheckGLError("Drawing floor");
 }
 
-void TreasureHuntRenderer::DrawDaydreamCursor(ViewType view) {
-  glUseProgram(reticle_program_);
-  if (view == kMultiview) {
-    glUniformMatrix4fv(
-        reticle_modelview_projection_param_, 2, GL_FALSE,
-        MatrixPairToGLArray(modelview_projection_cursor_).data());
-  } else {
-    glUniformMatrix4fv(
-        reticle_modelview_projection_param_, 1, GL_FALSE,
-        MatrixToGLArray(modelview_projection_cursor_[view]).data());
-  }
-  glVertexAttribPointer(reticle_position_param_, kCoordsPerVertex, GL_FLOAT,
-                        false, 0, reticle_vertices_);
-  glEnableVertexAttribArray(reticle_position_param_);
-  glDrawArrays(GL_TRIANGLES, 0, 6);
-  glDisableVertexAttribArray(reticle_position_param_);
-  CheckGLError("Drawing cursor");
-}
-
-void TreasureHuntRenderer::DrawCardboardReticle() {
+void TreasureHuntRenderer::DrawReticle() {
   glViewport(0, 0, reticle_render_size_.width, reticle_render_size_.height);
   glUseProgram(reticle_program_);
   const gvr::Mat4f uniform_matrix = {{{1.f, 0.f, 0.f, 0.f},
@@ -786,8 +796,8 @@ void TreasureHuntRenderer::HideObject() {
   cube_position[1] *= scale;
   cube_position[2] *= scale;
 
-  // Choose a random yaw for the cube between pi/4 and -pi/4.
-  const float yaw = M_PI * (RandomUniformFloat() - 0.5f) / 2.0f;
+  // Choose a random yaw for the cube between 0 and pi/4.
+  const float yaw = M_PI * (RandomUniformFloat()) / 4.0f;
   cube_position[1] = tanf(yaw) * object_distance_;
 
   model_cube_.m[0][3] = cube_position[0];
@@ -800,48 +810,22 @@ void TreasureHuntRenderer::HideObject() {
   }
 }
 
-bool TreasureHuntRenderer::ObjectIsFound() {
-  switch (gvr_viewer_type_) {
-    case GVR_VIEWER_TYPE_CARDBOARD: {
-      return IsLookingAtObject();
-      break;
-    }
-    case GVR_VIEWER_TYPE_DAYDREAM: {
-      return IsPointingAtObject();
-      break;
-    }
-    default:
-      LOGW("Unexpected viewer type.");
-      return false;
-      break;
-  }
-}
-
-bool TreasureHuntRenderer::IsLookingAtObject() {
-  const gvr::Mat4f modelview = MatrixMul(head_view_, model_cube_);
-
-  const std::array<float, 4> temp_position =
-      MatrixVectorMul(modelview, {0.f, 0.f, 0.f, 1.f});
-
-  float pitch = std::atan2(temp_position[1], -temp_position[2]);
-  float yaw = std::atan2(temp_position[0], -temp_position[2]);
-
-  return std::abs(pitch) < kPitchLimit && std::abs(yaw) < kYawLimit;
-}
-
 bool TreasureHuntRenderer::IsPointingAtObject() {
-  gvr::Mat4f modelview_cursor = MatrixMul(head_view_, model_cursor_);
-  gvr::Mat4f modelview_cube = MatrixMul(head_view_, model_cube_);
+  // Compute vectors pointing towards the reticle and towards the cube in head
+  // space.
+  gvr::Mat4f head_from_reticle = modelview_reticle_;
+  gvr::Mat4f head_from_cube = MatrixMul(head_view_, model_cube_);
+  const std::array<float, 4> reticle_vector =
+      MatrixVectorMul(head_from_reticle, {0.f, 0.f, 0.f, 1.f});
+  const std::array<float, 4> cube_vector =
+      MatrixVectorMul(head_from_cube, {0.f, 0.f, 0.f, 1.f});
 
-  const std::array<float, 4> center_cursor_position =
-      MatrixVectorMul(modelview_cursor, {0.f, 0.f, 0.f, 1.f});
-
-  const std::array<float, 4> center_cube_position =
-      MatrixVectorMul(modelview_cube, {0.f, 0.f, 0.f, 1.f});
-
-  float angle = std::acos(
-      VectorInnerProduct(center_cursor_position, center_cube_position) /
-      VectorNorm(center_cursor_position) / VectorNorm(center_cube_position));
+  // Compute the angle between the vector towards the reticle and the vector
+  // towards the cube by computing the arc cosine of their normalized dot
+  // product.
+  float angle = std::acos(std::max(-1.f, std::min(1.f,
+      VectorInnerProduct(reticle_vector, cube_vector) /
+      VectorNorm(reticle_vector) / VectorNorm(cube_vector))));
   return angle < kAngleLimit;
 }
 
